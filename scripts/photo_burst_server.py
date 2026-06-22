@@ -657,8 +657,15 @@ def year_page(store: BurstStore, year: str) -> str:
         for item_id in ids:
             row = store.rows_by_id[item_id]
             is_auto_keep = row.get("action") == "auto_keep"
+            auto_keep_rule = row.get("auto_keep_rule") or "largest_file"
             keep_class = " auto-keep" if is_auto_keep else ""
-            badge = '<span class="badge">auto keep</span>' if is_auto_keep else ""
+            badge_text = "sharpest" if auto_keep_rule == "sharpness" else "auto keep"
+            badge = f'<span class="badge">{badge_text}</span>' if is_auto_keep else ""
+            sharpness_meta = ""
+            if row.get("sharpness_score"):
+                sharpness_meta = f'<span>резкость {html.escape(row["sharpness_score"])}</span>'
+            elif row.get("sharpness_error"):
+                sharpness_meta = f'<span>резкость: ошибка</span>'
             cards.append(
                 f"""
                 <article class="photo-card{keep_class}" id="card-{item_id}" data-id="{item_id}" data-group="{html.escape(group_id)}">
@@ -669,6 +676,7 @@ def year_page(store: BurstStore, year: str) -> str:
                   </div>
                   <div class="meta">
                     <strong>{html.escape(row["size_human"])}</strong>
+                    {sharpness_meta}
                     <span>{html.escape(row["date"])}</span>
                     <code>{html.escape(row["rel_path"])}</code>
                   </div>
@@ -695,7 +703,7 @@ def year_page(store: BurstStore, year: str) -> str:
     body = f"""
   <header>
     <h1>Серии {html.escape(year)}</h1>
-    <p>Это похожие кадры, а не точные дубли. “Оставить это” убирает остальные кадры этой серии в Trash.</p>
+    <p>Это похожие кадры, а не точные дубли. Если план построен по резкости, бейдж `sharpest` показывает самый резкий кандидат в серии.</p>
   </header>
   <main>
     <div class="toolbar">

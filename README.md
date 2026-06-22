@@ -84,6 +84,44 @@ http://127.0.0.1:8766/
 The app shows groups by year. `auto keep` is only a rough suggestion based on
 largest file size in the group; use your eyes before removing important frames.
 
+### Sharper Auto-Keep Suggestions
+
+If ImageMagick is installed, the burst planner can score blur/focus and choose
+the sharpest frame in each series:
+
+```bash
+python3 -B scripts/photo_burst_plan.py \
+  outputs/photo_audit \
+  --max-gap-seconds 2 \
+  --min-files 2 \
+  --sharpness \
+  --output-dir outputs/photo_audit/burst_cleanup_sharp
+```
+
+The sharpness score uses a resized grayscale copy plus a Laplacian edge filter.
+It is a practical focus/blur heuristic, not an artistic ranking.
+
+Dropbox on-demand files are handled cautiously. By default, `--sharpness` uses
+`--sharpness-hydration local-only`, which skips cloud-only placeholders instead
+of downloading them. Those rows are marked as `cloud_only_not_downloaded`, and
+the planner falls back to largest-file selection when a group has no scored
+frames.
+
+To intentionally allow Dropbox downloads during scoring:
+
+```bash
+python3 -B scripts/photo_burst_plan.py \
+  outputs/photo_audit \
+  --max-gap-seconds 2 \
+  --min-files 2 \
+  --sharpness \
+  --sharpness-hydration download \
+  --output-dir outputs/photo_audit/burst_cleanup_sharp_full
+```
+
+Sharpness results are cached in `sharpness_cache.json` inside the output
+directory so repeated runs do not rescore unchanged local files.
+
 ## Dry-Run Organization Plan
 
 Create a CSV showing where files could be organized by year/month:

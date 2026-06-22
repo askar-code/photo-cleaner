@@ -14,6 +14,10 @@ import csv
 import datetime as dt
 import html
 import json
+import shutil
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -28,6 +32,33 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output directory. Defaults to audit_dir/burst_cleanup",
     )
+    parser.add_argument(
+        "--sharpness",
+        action="store_true",
+        help="Score files with ImageMagick and choose auto-keep by sharpness.",
+    )
+    parser.add_argument("--magick", default="magick", help="ImageMagick executable")
+    parser.add_argument("--sharpness-resize", type=int, default=768)
+    parser.add_argument("--sharpness-timeout", type=float, default=20.0)
+    parser.add_argument("--sharpness-workers", type=int, default=4)
+    parser.add_argument(
+        "--sharpness-hydration",
+        choices=("local-only", "download"),
+        default="local-only",
+        help="local-only skips cloud placeholders; download may trigger Dropbox downloads.",
+    )
+    parser.add_argument(
+        "--local-block-ratio",
+        type=float,
+        default=0.8,
+        help="Minimum allocated-blocks/size ratio considered locally available.",
+    )
+    parser.add_argument(
+        "--sharpness-cache",
+        default=None,
+        help="JSON cache path. Defaults to output_dir/sharpness_cache.json.",
+    )
+    parser.add_argument("--progress-every", type=int, default=250)
     return parser.parse_args()
 
 
@@ -73,10 +104,237 @@ def find_groups(rows: list[dict], max_gap_seconds: float, min_files: int) -> lis
     return groups
 
 
-def choose_keep(group: list[dict]) -> dict:
+def choose_keep(group: list[dict], auto_keep_rule: str) -> tuple[dict, str]:
+    if auto_keep_rule == "sharpness":
+        scored = [row for row in group if row.get("_sharpness_score") is not None]
+        if scored:
+            return (
+                max(
+                    scored,
+                    key=lambda r: (
+                        float(r["_sharpness_score"]),
+                        int(r.get("size") or 0),
+                        r["_parsed_date"],
+                        r["rel_path"],
+                    ),
+                ),
+                "sharpness",
+            )
     # Byte size is a crude proxy for detail when camera/settings are similar.
     # Prefer it only as an auto-review starting point, not a final aesthetic call.
-    return max(group, key=lambda r: (int(r.get("size") or 0), r["_parsed_date"], r["rel_path"]))
+    return (
+        max(group, key=lambda r: (int(r.get("size") or 0), r["_parsed_date"], r["rel_path"])),
+        "largest_file",
+    )
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def sharpness_cache_key(path: Path, resize: int) -> str:
+    try:
+        stat = path.stat()
+        blocks = getattr(stat, "st_blocks", "")
+        fingerprint = f"{path}|{stat.st_size}|{stat.st_mtime_ns}|{blocks}|{resize}"
+    except OSError:
+        fingerprint = f"{path}|missing|{resize}"
+    return hashlib_sha1(fingerprint)
+
+
+def local_block_ratio(path: Path) -> float:
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0.0
+    if stat.st_size <= 0:
+        return 1.0
+    blocks = getattr(stat, "st_blocks", 0)
+    return (blocks * 512) / stat.st_size
+
+
+def is_probably_local(path: Path, min_ratio: float) -> bool:
+    return local_block_ratio(path) >= min_ratio
+
+
+def hashlib_sha1(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def compute_sharpness(
+    magick: str,
+    path: Path,
+    resize: int,
+    timeout: float,
+) -> tuple[float | None, str]:
+    if not path.exists():
+        return None, "file_missing"
+    command = [
+        magick,
+        str(path),
+        "-auto-orient",
+        "-resize",
+        f"{resize}x{resize}>",
+        "-colorspace",
+        "Gray",
+        "-define",
+        "convolve:scale=!",
+        "-morphology",
+        "Convolve",
+        "Laplacian",
+        "-format",
+        "%[fx:standard_deviation]",
+        "info:",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError as exc:
+        return None, str(exc)
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or f"exit_{result.returncode}").strip()
+        return None, error[:240]
+    try:
+        return float(result.stdout.strip()), ""
+    except ValueError:
+        return None, f"bad_output: {result.stdout.strip()[:80]}"
+
+
+def score_sharpness_for_groups(
+    groups: list[list[dict]],
+    magick: str,
+    cache_path: Path,
+    resize: int,
+    timeout: float,
+    workers: int,
+    hydration: str,
+    min_local_ratio: float,
+    progress_every: int,
+) -> dict:
+    magick_path = shutil.which(magick)
+    if not magick_path:
+        raise SystemExit(f"ImageMagick executable not found: {magick}")
+
+    cache = load_json(cache_path)
+    unique_rows: dict[str, dict] = {}
+    for group in groups:
+        for row in group:
+            unique_rows[row["abs_path"]] = row
+
+    cache_hits = 0
+    skipped_cloud_only = 0
+    pending: list[tuple[dict, Path, str]] = []
+    for index, row in enumerate(unique_rows.values(), start=1):
+        path = Path(row["abs_path"])
+        key = sharpness_cache_key(path, resize)
+        cached = cache.get(key)
+        if cached:
+            row["_sharpness_score"] = cached.get("score")
+            row["_sharpness_error"] = cached.get("error") or ""
+            cache_hits += 1
+        elif hydration == "local-only" and not is_probably_local(path, min_local_ratio):
+            ratio = local_block_ratio(path)
+            row["_sharpness_score"] = None
+            row["_sharpness_error"] = "cloud_only_not_downloaded"
+            cache[key] = {
+                "path": str(path),
+                "resize": resize,
+                "score": None,
+                "error": "cloud_only_not_downloaded",
+                "local_block_ratio": ratio,
+            }
+            skipped_cloud_only += 1
+        else:
+            pending.append((row, path, key))
+
+    computed = 0
+    errors = 0
+    completed = cache_hits + skipped_cloud_only
+    workers = max(1, workers)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(compute_sharpness, magick_path, path, resize, timeout): (row, path, key)
+            for row, path, key in pending
+        }
+        for future in as_completed(future_map):
+            row, path, key = future_map[future]
+            score, error = future.result()
+            row["_sharpness_score"] = score
+            row["_sharpness_error"] = error
+            cache[key] = {
+                "path": str(path),
+                "resize": resize,
+                "score": score,
+                "error": error,
+                "local_block_ratio": local_block_ratio(path),
+            }
+            computed += 1
+            completed += 1
+            if error:
+                errors += 1
+            if progress_every and completed % progress_every == 0:
+                write_json(cache_path, cache)
+                print(
+                    f"Sharpness scored {completed}/{len(unique_rows)} files "
+                    f"({cache_hits} cached, {computed} computed, "
+                    f"{skipped_cloud_only} cloud-only skipped, {errors} errors)...",
+                    file=sys.stderr,
+                )
+
+    if progress_every and completed and completed % progress_every != 0:
+        print(
+            f"Sharpness scored {completed}/{len(unique_rows)} files "
+            f"({cache_hits} cached, {computed} computed, "
+            f"{skipped_cloud_only} cloud-only skipped, {errors} errors).",
+            file=sys.stderr,
+        )
+
+    for row in unique_rows.values():
+        if "_sharpness_score" not in row:
+            row["_sharpness_score"] = None
+            row["_sharpness_error"] = "not_scored"
+
+    if cache_hits:
+        if progress_every:
+            write_json(cache_path, cache)
+
+    write_json(cache_path, cache)
+    return {
+        "sharpness_cache": str(cache_path),
+        "sharpness_files": len(unique_rows),
+        "sharpness_cache_hits": cache_hits,
+        "sharpness_computed": computed,
+        "sharpness_errors": sum(
+            1
+            for row in unique_rows.values()
+            if row.get("_sharpness_error")
+            and row.get("_sharpness_error") != "cloud_only_not_downloaded"
+        ),
+        "sharpness_cloud_only_skipped": sum(
+            1
+            for row in unique_rows.values()
+            if row.get("_sharpness_error") == "cloud_only_not_downloaded"
+        ),
+        "sharpness_hydration": hydration,
+    }
 
 
 def human_size(size: int) -> str:
@@ -98,15 +356,16 @@ def write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
         writer.writerows([{field: row.get(field, "") for field in fieldnames} for row in rows])
 
 
-def make_plan(groups: list[list[dict]]) -> tuple[list[dict], list[dict]]:
+def make_plan(groups: list[list[dict]], auto_keep_rule: str) -> tuple[list[dict], list[dict]]:
     plan_rows: list[dict] = []
     group_rows: list[dict] = []
     for group_index, group in enumerate(groups, start=1):
-        keep = choose_keep(group)
+        keep, keep_reason = choose_keep(group, auto_keep_rule)
         start = group[0]["_parsed_date"]
         end = group[-1]["_parsed_date"]
         group_bytes = sum(int(row.get("size") or 0) for row in group)
         reject_bytes = group_bytes - int(keep.get("size") or 0)
+        keep_score = keep.get("_sharpness_score")
         group_rows.append(
             {
                 "burst_group": group_index,
@@ -118,6 +377,8 @@ def make_plan(groups: list[list[dict]]) -> tuple[list[dict], list[dict]]:
                 "group_size": group_bytes,
                 "group_size_human": human_size(group_bytes),
                 "auto_keep_rel_path": keep["rel_path"],
+                "auto_keep_rule": keep_reason,
+                "auto_keep_sharpness_score": keep_score if keep_score is not None else "",
                 "candidate_reject_files": len(group) - 1,
                 "candidate_reject_size": reject_bytes,
                 "candidate_reject_size_human": human_size(reject_bytes),
@@ -135,6 +396,11 @@ def make_plan(groups: list[list[dict]]) -> tuple[list[dict], list[dict]]:
                     "rel_path": row["rel_path"],
                     "abs_path": row["abs_path"],
                     "auto_keep_rel_path": keep["rel_path"],
+                    "auto_keep_rule": keep_reason,
+                    "sharpness_score": row.get("_sharpness_score")
+                    if row.get("_sharpness_score") is not None
+                    else "",
+                    "sharpness_error": row.get("_sharpness_error") or "",
                     "group_start": start.isoformat(sep=" "),
                     "group_end": end.isoformat(sep=" "),
                     "span_seconds": int((end - start).total_seconds()),
@@ -254,7 +520,7 @@ th { background: #f0f4f8; }
 <body>
   <h1>Burst Cleanup Review</h1>
   <p>This is a dry-run review. It does not move or delete source files.</p>
-  <p>Auto-keep is chosen by largest file size inside each fast sequence. Treat it as a shortcut, not a final judgment.</p>
+  <p>Auto-keep rule: {html.escape(summary["auto_keep_rule_label"])}. Treat it as a shortcut, not a final judgment.</p>
   <div class="metrics">
     <div class="metric"><strong>{summary["burst_groups"]}</strong>Burst groups</div>
     <div class="metric"><strong>{summary["burst_files"]}</strong>Files in bursts</div>
@@ -289,11 +555,16 @@ th { background: #f0f4f8; }
                 css_class = "frame keep" if is_keep else "frame reject"
                 badge = "auto keep" if is_keep else "candidate quarantine"
                 uri = file_uri(frame["abs_path"])
+                sharpness_line = ""
+                if frame.get("sharpness_score"):
+                    sharpness_line = f"<br>sharpness {html.escape(str(frame['sharpness_score']))}"
+                elif frame.get("sharpness_error"):
+                    sharpness_line = f"<br>sharpness error: {html.escape(str(frame['sharpness_error']))}"
                 pieces.append(
                     f"<article class=\"{css_class}\">"
                     f"<a href=\"{html.escape(uri)}\"><img loading=\"lazy\" src=\"{html.escape(uri)}\" alt=\"\"></a>"
                     f"<div class=\"meta\"><span class=\"badge\">{badge}</span><br>"
-                    f"{html.escape(frame['date'])}<br>{html.escape(frame['size_human'])}<br>"
+                    f"{html.escape(frame['date'])}<br>{html.escape(frame['size_human'])}{sharpness_line}<br>"
                     f"{html.escape(frame['rel_path'])}</div></article>"
                 )
             pieces.append("</div></section>")
@@ -310,7 +581,7 @@ This is a dry-run plan. It did not move, edit, or delete source files.
 
 - Max gap between consecutive photos: {summary["max_gap_seconds"]} seconds
 - Minimum files per burst: {summary["min_files"]}
-- Auto-keep rule: largest file size in each burst group
+- Auto-keep rule: {summary["auto_keep_rule_label"]}
 
 ## Result
 
@@ -319,6 +590,12 @@ This is a dry-run plan. It did not move, edit, or delete source files.
 - Auto-kept files: {summary["auto_keep_files"]}
 - Candidate quarantine files: {summary["candidate_reject_files"]}
 - Candidate quarantine size: {summary["candidate_reject_size_human"]}
+- Sharpness files considered: {summary.get("sharpness_files", 0)}
+- Sharpness hydration mode: {summary.get("sharpness_hydration", "")}
+- Sharpness cache hits: {summary.get("sharpness_cache_hits", 0)}
+- Sharpness newly computed: {summary.get("sharpness_computed", 0)}
+- Sharpness cloud-only skipped: {summary.get("sharpness_cloud_only_skipped", 0)}
+- Sharpness errors: {summary.get("sharpness_errors", 0)}
 
 ## Files
 
@@ -337,23 +614,52 @@ def main() -> int:
 
     rows = read_file_rows(audit_dir)
     groups = find_groups(rows, args.max_gap_seconds, args.min_files)
-    group_rows, plan_rows = make_plan(groups)
+    auto_keep_rule = "sharpness" if args.sharpness else "largest_file"
+    score_stats: dict = {}
+    if args.sharpness:
+        cache_path = (
+            Path(args.sharpness_cache).expanduser().resolve()
+            if args.sharpness_cache
+            else output_dir / "sharpness_cache.json"
+        )
+        print(f"Scoring sharpness with ImageMagick; cache: {cache_path}", file=sys.stderr)
+        score_stats = score_sharpness_for_groups(
+            groups,
+            args.magick,
+            cache_path,
+            args.sharpness_resize,
+            args.sharpness_timeout,
+            args.sharpness_workers,
+            args.sharpness_hydration,
+            args.local_block_ratio,
+            args.progress_every,
+        )
+    group_rows, plan_rows = make_plan(groups, auto_keep_rule)
     candidate_reject_size = sum(
         int(row.get("size") or 0) for row in plan_rows if row["action"] == "candidate_quarantine"
     )
     action_counts = Counter(row["action"] for row in plan_rows)
+    auto_keep_rule_label = (
+        f"sharpness score via ImageMagick Laplacian (resize {args.sharpness_resize}px)"
+        if args.sharpness
+        else "largest file size in each burst group"
+    )
     summary = {
         "audit_dir": str(audit_dir),
         "output_dir": str(output_dir),
         "generated_at": dt.datetime.now().replace(microsecond=0).isoformat(sep=" "),
         "max_gap_seconds": args.max_gap_seconds,
         "min_files": args.min_files,
+        "auto_keep_rule": auto_keep_rule,
+        "auto_keep_rule_label": auto_keep_rule_label,
+        "sharpness_hydration": args.sharpness_hydration if args.sharpness else "",
         "burst_groups": len(group_rows),
         "burst_files": len(plan_rows),
         "auto_keep_files": action_counts["auto_keep"],
         "candidate_reject_files": action_counts["candidate_quarantine"],
         "candidate_reject_size": candidate_reject_size,
         "candidate_reject_size_human": human_size(candidate_reject_size),
+        **score_stats,
     }
 
     write_csv(
@@ -369,6 +675,8 @@ def main() -> int:
             "group_size",
             "group_size_human",
             "auto_keep_rel_path",
+            "auto_keep_rule",
+            "auto_keep_sharpness_score",
             "candidate_reject_files",
             "candidate_reject_size",
             "candidate_reject_size_human",
@@ -386,6 +694,9 @@ def main() -> int:
             "rel_path",
             "abs_path",
             "auto_keep_rel_path",
+            "auto_keep_rule",
+            "sharpness_score",
+            "sharpness_error",
             "group_start",
             "group_end",
             "span_seconds",
