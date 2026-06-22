@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated audit data and review state can contain personal filenames/paths.
+outputs/
+photo_audit/
+duplicate_review_app/
+burst_review_app/
+*.csv
+*.json
+*.jsonl
+
+# Local virtual environments.
+.venv/
+venv/
