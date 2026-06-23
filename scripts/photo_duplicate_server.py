@@ -276,7 +276,9 @@ def build_html(store: DuplicateStore) -> str:
                 f"""
                 <article class="photo-card {css_state}" id="card-{item_id}" data-id="{item_id}" data-group="{html.escape(group_id)}">
                   <div class="image-wrap">
-                    <img src="/image/{item_id}" alt="" loading="lazy">
+                    <a class="image-link" href="/image/{item_id}" target="_blank" rel="noopener">
+                      <img src="/image/{item_id}" alt="" loading="lazy">
+                    </a>
                     <span class="status" data-status>Status: {html.escape(item_state)}</span>
                   </div>
                   <div class="meta">
@@ -401,6 +403,10 @@ def build_html(store: DuplicateStore) -> str:
     .image-wrap {{
       background: #e8eef5;
       position: relative;
+    }}
+    .image-link {{
+      color: inherit;
+      display: block;
     }}
     img {{
       aspect-ratio: 1 / 1;

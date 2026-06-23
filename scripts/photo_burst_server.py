@@ -407,6 +407,10 @@ def page_shell(title: str, body: str, state: dict[str, Any] | None = None) -> st
       background: #e8eef5;
       position: relative;
     }}
+    .image-link {{
+      color: inherit;
+      display: block;
+    }}
     img {{
       aspect-ratio: 1 / 1;
       display: block;
@@ -670,7 +674,9 @@ def year_page(store: BurstStore, year: str) -> str:
                 f"""
                 <article class="photo-card{keep_class}" id="card-{item_id}" data-id="{item_id}" data-group="{html.escape(group_id)}">
                   <div class="image-wrap">
-                    <img src="/image/{item_id}" alt="" loading="lazy">
+                    <a class="image-link" href="/image/{item_id}" target="_blank" rel="noopener">
+                      <img src="/image/{item_id}" alt="" loading="lazy">
+                    </a>
                     <span class="status" data-status>status</span>
                     {badge}
                   </div>
